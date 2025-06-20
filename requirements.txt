@@ -1,4 +1,5 @@
 # requirements.txt
+absl-py
 flag
 gymnasium
 gymnasium[box2d]
