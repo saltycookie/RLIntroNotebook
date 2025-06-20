@@ -1,0 +1,5 @@
+# requirements.txt
+flag
+gymnasium
+gymnasium[box2d]
+jax
