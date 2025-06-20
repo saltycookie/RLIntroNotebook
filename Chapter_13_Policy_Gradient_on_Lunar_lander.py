@@ -1,4 +1,5 @@
-import flag
+from absl import app
+from absl import flags
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -6,14 +7,16 @@ from jax.scipy.special import logsumexp
 import math
 import random
 
+FLAGS = flags.FLAGS
 
-flag_prng_seed = flag.int("prng_seed", 0, "Seed for JAX's pseudo random number generator.")
+flags.DEFINE_integer("prng_seed", 0, "Seed for JAX's pseudo random number generator.")
 
-flag_batch_size = flag.int("batch_size", 64, "Number of episodes to simulate simultaneously for one gradient update.")
+flags.DEFINE_integer("batch_size", 128,
+                     "Number of episodes to simulate simultaneously for one gradient update.")
 
-flag_learning_rate = flag.int("learning_rate", 0.00001, "Learning rate.")
+flags.DEFINE_float("learning_rate", 0.001, "Learning rate.")
 
-flag_train_steps = flag.int("train_steps", 10, "Number of training steps.")
+flags.DEFINE_integer("train_steps", 10, "Number of training steps.")
 
 
 def probabilistic_selection(prng_key, probabilities):
@@ -76,24 +79,26 @@ class Agent:
     print("Longest episode length: ", len(act_list))
     print("Number of successful landings: ", num_success)
     avg_reward = jnp.mean(acc_rewards)
-    all_rewards = (jnp.zeros((len(act_list), batch_size)) + acc_rewards[jnp.newaxis, :]).reshape([-1])
+    all_rewards = jnp.tile(acc_rewards, (len(act_list), 1)).reshape(-1)
     all_obs = jnp.array(obs_list).reshape([len(obs_list) * batch_size, -1])
     all_acts = jnp.array(act_list).reshape([-1])
     all_masks = jnp.array(active_list).reshape([-1])
-    print('masked percentage: ', jnp.sum(all_masks == False) / all_masks.size)
+    print('Masked percentage: ', jnp.sum(all_masks == False) / all_masks.size)
     uniq_actions, frequency_count = jnp.unique(all_acts[all_masks], return_counts=True)
-    print("actions frequency: ", dict(zip(uniq_actions.tolist(), frequency_count.tolist())))
+    print("Actions frequency: ", dict(zip(uniq_actions.tolist(), frequency_count.tolist())))
 
     def get_obj_fn(all_obs, all_acts, all_rewards):
       def obj_fn(weights, biases):
         logits = mlp_logits_fn(weights, biases, all_obs)
         indices = (jnp.arange(all_acts.shape[0]), all_acts)
         log_probs = logits[indices] - logsumexp(logits, axis=1)
-        return jnp.sum(log_probs * all_rewards)
+        return jnp.sum(log_probs * all_rewards) / batch_size
       return obj_fn
 
     grad_weights, grad_biases = jax.grad(
-      get_obj_fn(all_obs[all_masks], all_acts[all_masks], all_rewards[all_masks]), argnums=(0, 1))(self.weights, self.biases)
+      get_obj_fn(all_obs[all_masks],
+                 all_acts[all_masks],
+                 all_rewards[all_masks]), argnums=(0, 1))(self.weights, self.biases)
     for i in range(len(self.weights)):
       self.weights[i] += delta * grad_weights[i]
     for i in range(len(self.biases)):
@@ -101,13 +106,18 @@ class Agent:
     return avg_reward
 
 
-if __name__ == "__main__":
-  flag.parse()
-  prng_seed = random.randint(1, 2 ** 32) if flag_prng_seed.value == 0 else flag_prng_seed.value
-  envs = gym.make_vec("LunarLander-v3", num_envs=flag_batch_size.value, vectorization_mode="sync")
+def main(argv):
+  prng_seed = random.randint(1, 2 ** 32) if FLAGS.prng_seed == 0 else FLAGS.prng_seed
+  print("Seed for generating Pseudo Random Number: ", prng_seed)
+  envs = gym.make_vec("LunarLander-v3", num_envs=FLAGS.batch_size, vectorization_mode="sync")
   agent = Agent(prng_seed, 8, [8], 4)
-  for n_step in range(flag_train_steps.value):
-    avg_reward = agent.train(envs, flag_batch_size.value, flag_learning_rate.value)
+  for n_step in range(FLAGS.train_steps):
+    avg_reward = agent.train(envs, FLAGS.batch_size, FLAGS.learning_rate)
     print("Step %3d: avg_reward [%8.3f]" % (n_step, avg_reward))
     print()
   envs.close()
+
+
+if __name__ == "__main__":
+  app.run(main)
+
