@@ -19,6 +19,7 @@ flags.DEFINE_float("learning_rate", 0.001, "Learning rate.")
 flags.DEFINE_integer("train_steps", 10, "Number of training steps.")
 
 
+@jax.jit
 def probabilistic_selection(prng_key, probabilities):
   cumulative_probs = jnp.cumsum(probabilities, axis=-1)
   random_numbers = jax.random.uniform(prng_key, (*probabilities.shape[:-1], 1))
@@ -73,7 +74,7 @@ class Agent:
       actions = self.act(obs)
       act_list.append(actions)
       obs, rewards, terminated, truncated, infos = envs.step(actions.tolist())
-      num_success += jnp.sum(rewards[truncated | terminated] == 100.0)
+      num_success += jnp.sum(rewards[active & (truncated | terminated)] == 100.0)
       acc_rewards += jnp.where(active, rewards, jnp.zeros_like(rewards))
       active &= ~(terminated | truncated)
     print("Longest episode length: ", len(act_list))
@@ -109,8 +110,12 @@ class Agent:
 def main(argv):
   prng_seed = random.randint(1, 2 ** 32) if FLAGS.prng_seed == 0 else FLAGS.prng_seed
   print("Seed for generating Pseudo Random Number: ", prng_seed)
+  dummy_env = gym.make("LunarLander-v3")
+  num_features = dummy_env.observation_space.shape[0]
+  num_actions = dummy_env.action_space.n
+  dummy_env.close()
   envs = gym.make_vec("LunarLander-v3", num_envs=FLAGS.batch_size, vectorization_mode="sync")
-  agent = Agent(prng_seed, 8, [8], 4)
+  agent = Agent(prng_seed, num_features, [8], num_actions)
   for n_step in range(FLAGS.train_steps):
     avg_reward = agent.train(envs, FLAGS.batch_size, FLAGS.learning_rate)
     print("Step %3d: avg_reward [%8.3f]" % (n_step, avg_reward))
@@ -120,4 +125,3 @@ def main(argv):
 
 if __name__ == "__main__":
   app.run(main)
-
