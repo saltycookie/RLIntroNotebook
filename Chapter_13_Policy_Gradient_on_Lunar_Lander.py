@@ -1,5 +1,4 @@
-from absl import app
-from absl import flags
+import fire
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -8,31 +7,19 @@ import math
 import optax
 import random
 
-FLAGS = flags.FLAGS
-
-flags.DEFINE_integer("prng_seed", 0, "Seed for JAX's pseudo random number generator.")
-
-flags.DEFINE_integer("batch_size", 128,
-                     "Number of episodes to simulate simultaneously for one gradient update.")
-
-flags.DEFINE_float("learning_rate", 0.05, "Learning rate.")
-
-flags.DEFINE_integer("train_steps", 200, "Number of training steps.")
-
-
 def mlp_init_params(prng_key, num_features, hidden_layer_sizes, num_classes):
   weights = []
   biases = []
-  num_previous = num_features
-  for layer_size in hidden_layer_sizes + [num_classes]:
+  for num_prev, num_next in zip(
+      [num_features] + hidden_layer_sizes, hidden_layer_sizes + [num_classes]):
     prng_key, sub_key = jax.random.split(prng_key)
     weights.append(jax.random.normal(
-      sub_key, shape=[num_previous, layer_size]) * math.sqrt(2 / num_previous))
-    biases.append(jnp.zeros(layer_size, dtype=float))
-    num_previous = layer_size
+      sub_key, shape=[num_prev, num_next]) * math.sqrt(2 / num_prev))
+    biases.append(jnp.zeros(num_next, dtype=float))
   return (weights, biases)
 
 
+@jax.jit
 def mlp_forward_pass(params, features):
   weights, biases = params
   output = features
@@ -45,11 +32,13 @@ def mlp_forward_pass(params, features):
   return output
 
 
+@jax.jit
 def policy_sample(prng_key, params, obs_batch):
   logits = mlp_forward_pass(params, obs_batch)
   return jax.random.categorical(prng_key, logits)  
 
 
+@jax.jit
 def policy_loss_fn(params, obs_batch, action_batch, reward_batch, num_episodes):
   logits = mlp_forward_pass(params, obs_batch)
   indices = jnp.arange(obs_batch.shape[0]), action_batch
@@ -58,8 +47,11 @@ def policy_loss_fn(params, obs_batch, action_batch, reward_batch, num_episodes):
 
 
 class Agent:
-  def __init__(self, prng_seed, num_features, hidden_layer_sizes, num_actions, learning_rate):
-    self.prng_key = jax.random.key(prng_seed)
+  def __init__(self,
+               gym_env_seed, jax_prng_seed, num_features, hidden_layer_sizes,
+               num_actions, learning_rate):
+    self.gym_env_seed = gym_env_seed
+    self.prng_key = jax.random.key(jax_prng_seed)
     self.prng_key, sub_key = jax.random.split(self.prng_key)
     self.params = mlp_init_params(sub_key, num_features, hidden_layer_sizes, num_actions)
     self.optimizer = optax.adam(learning_rate)
@@ -69,8 +61,10 @@ class Agent:
     self.prng_key, sub_key = jax.random.split(self.prng_key)
     return policy_sample(sub_key, self.params, observations)
 
-  def train(self, envs, batch_size):
-    obs, _ = envs.reset(seed=42)
+  def train(self, envs):
+    batch_size = len(envs.envs)
+    obs, _ = envs.reset(seed=self.gym_env_seed)
+    self.gym_env_seed += batch_size
     any_active = True
     active = jnp.full([batch_size], True)
     obs_list = []   # shape: [eps_len, batch_size, obs_size]
@@ -85,22 +79,22 @@ class Agent:
       obs_list.append(obs)
       actions = self.act(obs)
       act_list.append(actions)
-      obs, rewards, terminated, truncated, infos = envs.step(actions.tolist())
+      obs, rewards, terminated, truncated, _ = envs.step(actions.tolist())
       num_success += jnp.sum(rewards[active & (truncated | terminated)] == 100.0)
       acc_rewards += jnp.where(active, rewards, jnp.zeros_like(rewards))
       active &= ~(terminated | truncated)
     episode_len = len(act_list)
-    print("Longest episode length: ", episode_len)
-    print("Number of successful landings: ", num_success)
+    print("\tLongest episode length: ", episode_len)
+    print("\tNumber of successful landings: ", num_success)
     avg_reward = jnp.mean(acc_rewards)
     all_obs = jnp.array(obs_list).reshape([episode_len * batch_size, -1])
     all_act = jnp.array(act_list).reshape([-1])
     # Ignore rewards before the state is encountered.
     all_future_reward = (acc_rewards[jnp.newaxis, :] - jnp.array(prv_reward_list)).reshape(-1)
     all_mask = jnp.array(active_list).reshape([-1])
-    print('Masked percentage: ', jnp.sum(all_mask == False) / all_mask.size)
+    print("\tMasked percentage: ", jnp.sum(all_mask == False) / all_mask.size)
     uniq_actions, frequency_count = jnp.unique(all_act[all_mask], return_counts=True)
-    print("Actions frequency: ", dict(zip(uniq_actions.tolist(), frequency_count.tolist())))
+    print("\tActions frequency: ", dict(zip(uniq_actions.tolist(), frequency_count.tolist())))
     grads = jax.grad(policy_loss_fn)(self.params,
                                      all_obs[all_mask],
                                      all_act[all_mask],
@@ -112,21 +106,47 @@ class Agent:
     return avg_reward
 
 
-def main(argv):
-  prng_seed = random.randint(1, 2 ** 32) if FLAGS.prng_seed == 0 else FLAGS.prng_seed
-  print("Seed for generating Pseudo Random Number: ", prng_seed)
+def main(gym_env_seed: int | None = None,
+         jax_prng_seed: int=0,
+         episodes_per_batch: int=128,
+         num_train_steps: int=200,
+         policy_network_hidden_layers: list[int]=[8],
+         policy_network_learning_rate: float=0.05):
+  if not jax_prng_seed:
+    jax_prng_seed = random.randint(1, 2 ** 32)
+    print("RNG Seed for JAX: ", jax_prng_seed)
+  if not gym_env_seed:
+    gym_env_seed = random.randint(1, 2 ** 32)
+    print("Gymnasium env seed: ", gym_env_seed)
   dummy_env = gym.make("LunarLander-v3")
   num_features = dummy_env.observation_space.shape[0]
   num_actions = dummy_env.action_space.n
   dummy_env.close()
-  envs = gym.make_vec("LunarLander-v3", num_envs=FLAGS.batch_size, vectorization_mode="sync")
-  agent = Agent(prng_seed, num_features, [8], num_actions, FLAGS.learning_rate)
-  for n_step in range(FLAGS.train_steps):
-    avg_reward = agent.train(envs, FLAGS.batch_size)
+  envs = gym.make_vec("LunarLander-v3", num_envs=episodes_per_batch, vectorization_mode="sync")
+  agent = Agent(gym_env_seed,
+                jax_prng_seed,
+                num_features,
+                policy_network_hidden_layers,
+                num_actions,
+                policy_network_learning_rate)
+  for n_step in range(num_train_steps):
+    avg_reward = agent.train(envs)
     print("Step %3d: avg_reward [%8.3f]" % (n_step, avg_reward))
     print()
   envs.close()
 
+  env = gym.make("LunarLander-v3", render_mode="human")
+  observation, _ = env.reset()
+  acc_reward = 0.0
+  for _ in range(2000):
+    action = agent.act(jnp.array([observation])).tolist()[0]
+    observation, reward, terminated, truncated, _ = env.step(action)
+    acc_reward += reward
+    if terminated or truncated:
+      observation, _ = env.reset()
+      print("Accumulated reward: ", acc_reward)
+      acc_reward = 0
+  env.close()
 
 if __name__ == "__main__":
-  app.run(main)
+  fire.Fire(main)
