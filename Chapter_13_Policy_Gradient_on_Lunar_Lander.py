@@ -33,15 +33,15 @@ def mlp_forward_pass(params, features):
 
 
 @jax.jit
-def policy_sample(prng_key, params, obs_batch):
-  logits = mlp_forward_pass(params, obs_batch)
-  return jax.random.categorical(prng_key, logits)  
+def policy_sample(prng_key, params, state_batch):
+  logits = mlp_forward_pass(params, state_batch)
+  return jax.random.categorical(prng_key, logits)
 
 
 @jax.jit
-def policy_loss_fn(params, obs_batch, action_batch, reward_batch, num_episodes):
-  logits = mlp_forward_pass(params, obs_batch)
-  indices = jnp.arange(obs_batch.shape[0]), action_batch
+def policy_loss_fn(params, state_batch, action_batch, reward_batch, num_episodes):
+  logits = mlp_forward_pass(params, state_batch)
+  indices = jnp.arange(state_batch.shape[0]), action_batch
   log_probs = logits[indices] - logsumexp(logits, axis=1)
   return -jnp.sum(log_probs * reward_batch) / num_episodes
 
@@ -61,14 +61,12 @@ class Agent:
     self.prng_key, sub_key = jax.random.split(self.prng_key)
     return policy_sample(sub_key, self.params, observations)
 
-  def train(self, envs):
-    batch_size = len(envs.envs)
-    obs, _ = envs.reset(seed=self.gym_env_seed)
+  def sample_episode(self, envs, batch_size):
+    state, _ = envs.reset(seed=self.gym_env_seed)
     self.gym_env_seed += batch_size
-    any_active = True
     active = jnp.full([batch_size], True)
-    obs_list = []   # shape: [eps_len, batch_size, obs_size]
-    act_list = []   # shape: [eps_len, batch_size]
+    state_list = []   # shape: [eps_len, batch_size, obs_size]
+    action_list = []   # shape: [eps_len, batch_size]
     prv_reward_list = []   # shape: [eps_len, batch_size]
     active_list = []  # shape: [eps_len, batch_size]
     acc_rewards = jnp.zeros([batch_size], dtype=float)  # shape: [batch_size]
@@ -76,28 +74,30 @@ class Agent:
     while jnp.any(active):
       active_list.append(active)
       prv_reward_list.append(acc_rewards.copy())
-      obs_list.append(obs)
-      actions = self.act(obs)
-      act_list.append(actions)
-      obs, rewards, terminated, truncated, _ = envs.step(actions.tolist())
+      state_list.append(state)
+      actions = self.act(state)
+      action_list.append(actions)
+      state, rewards, terminated, truncated, infos = envs.step(actions.tolist())
       num_success += jnp.sum(rewards[active & (truncated | terminated)] == 100.0)
       acc_rewards += jnp.where(active, rewards, jnp.zeros_like(rewards))
       active &= ~(terminated | truncated)
-    episode_len = len(act_list)
-    print("\tLongest episode length: ", episode_len)
-    print("\tNumber of successful landings: ", num_success)
+    episode_len = len(action_list)
+    print(f"Longest episode: {episode_len}, successful landings: {num_success}")
     avg_reward = jnp.mean(acc_rewards)
-    all_obs = jnp.array(obs_list).reshape([episode_len * batch_size, -1])
-    all_act = jnp.array(act_list).reshape([-1])
+    all_state = jnp.array(state_list).reshape([episode_len * batch_size, -1])
+    all_actions = jnp.array(action_list).reshape([-1])
     # Ignore rewards before the state is encountered.
     all_future_reward = (acc_rewards[jnp.newaxis, :] - jnp.array(prv_reward_list)).reshape(-1)
     all_mask = jnp.array(active_list).reshape([-1])
-    print("\tMasked percentage: ", jnp.sum(all_mask == False) / all_mask.size)
-    uniq_actions, frequency_count = jnp.unique(all_act[all_mask], return_counts=True)
-    print("\tActions frequency: ", dict(zip(uniq_actions.tolist(), frequency_count.tolist())))
+    print('Masked percentage: ', jnp.sum(all_mask == False) / all_mask.size)
+    return all_state, all_actions, all_future_reward, all_mask, avg_reward
+
+  def train(self, envs):
+    batch_size = len(envs.envs)
+    all_state, all_actions, all_future_reward, all_mask, avg_reward = self.sample_episode(envs, batch_size)
     grads = jax.grad(policy_loss_fn)(self.params,
-                                     all_obs[all_mask],
-                                     all_act[all_mask],
+                                     all_state[all_mask],
+                                     all_actions[all_mask],
                                      all_future_reward[all_mask],
                                      batch_size)
     updates, self.optimizer_state = self.optimizer.update(
@@ -132,7 +132,6 @@ def main(gym_env_seed: int | None = None,
   for n_step in range(num_train_steps):
     avg_reward = agent.train(envs)
     print("Step %3d: avg_reward [%8.3f]" % (n_step, avg_reward))
-    print()
   envs.close()
 
   env = gym.make("LunarLander-v3", render_mode="human")
